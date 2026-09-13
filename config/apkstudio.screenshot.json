@@ -1,0 +1,21 @@
+﻿{
+  "SrcApk": "C:\\Users\\maynot\\Downloads\\[GP] Standoff 2 (0.22.0).apk",
+  "ObbPath": "C:\\Users\\maynot\\Downloads\\main.2090.com.axlebolt.standoff2.obb",
+  "OutApk": "C:\\Users\\maynot\\Downloads\\stindofchik.apk",
+  "Package": "com.axlegang.projectrework",
+  "AppLabel": "ProjectRework",
+  "LibName": "pleasureproject",
+  "ServerIp": "84.21.173.237",
+  "WebClient": "296120477706-ugmpjoqn2rk7mpak48kairket34e9r4n.apps.googleusercontent.com",
+  "AndroidClient": "296120477706-ugmpjoqn2rk7mpak48kairket34e9r4n.apps.googleusercontent.com",
+  "GcmSender": "296120477706",
+  "GoogleAppId": "1:296120477706:android:e9fc2e6b1631c627cf57f3",
+  "ApiKey": "AIzaSyBQCZt00yshd9VFeyJHsOpy5uc_oGomaTo",
+  "ProjectId": "projectdraw-database",
+  "DbUrl": "https://projectdraw-database-default-rtdb.firebaseio.com",
+  "StorageBucket": "projectdraw-database.firebasestorage.app",
+  "KsPath": "C:\\Users\\maynot\\Downloads\\k.jks",
+  "KsAlias": "projectdraw",
+  "KsStorePass": "632363",
+  "KsKeyPass": "632363"
+}
