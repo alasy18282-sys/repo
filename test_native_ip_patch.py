@@ -4,9 +4,11 @@ import unittest
 from pathlib import Path
 
 from native_ip_patch import (
+    find_thumb_pic_refs,
     inspect_library,
     patch_file,
     patch_library,
+    standalone_cstr,
     valid_ipv4,
     xor_decode,
     xor_encode,
@@ -73,6 +75,23 @@ class MoonArmv7Tests(unittest.TestCase):
         self.assertIn("94.156.114.39", result["replaced"][0])
         self.assertIn(b"10.20.30.40", result["data"])
         self.assertNotIn(b"94.156.114.39", result["data"])
+
+    def test_longer_server_ip_relocates_pic(self):
+        original = MOON32.read_bytes()
+        host = original.find(b"94.156.114.39\x00")
+        self.assertGreaterEqual(host, 0)
+        self.assertTrue(standalone_cstr(original, host, b"94.156.114.39"))
+        self.assertTrue(find_thumb_pic_refs(original, host))
+        result = patch_library(original, "192.168.100.18")
+        self.assertGreaterEqual(result["count"], 1)
+        self.assertIn(b"192.168.100.18\x00", result["data"])
+        self.assertNotIn(b"94.156.114.39", result["data"])
+        new_host = result["data"].find(b"192.168.100.18\x00")
+        self.assertTrue(standalone_cstr(result["data"], new_host, b"192.168.100.18"))
+        self.assertTrue(find_thumb_pic_refs(result["data"], new_host))
+        self.assertFalse(find_thumb_pic_refs(result["data"], host))
+        again = patch_library(result["data"], "192.168.100.18")
+        self.assertTrue(again["already"])
 
 
 class PleasureProjectTests(unittest.TestCase):
