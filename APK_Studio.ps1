@@ -65,10 +65,231 @@ function Import-StudioConfig {
 $global:APKTOOL = Join-Path $global:ScriptDir 'libs\apktool.jar'
 $global:SIGNER = Join-Path $global:ScriptDir 'libs\uber-apk-signer.jar'
 
+function Get-JniRoot {
+    $scriptDir = $global:ScriptDir
+    if ([string]::IsNullOrWhiteSpace($scriptDir)) { $scriptDir = $PSScriptRoot }
+    $candidates = @($scriptDir, (Split-Path -Parent $scriptDir))
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if (Test-Path -LiteralPath (Join-Path $candidate 'Android.mk') -PathType Leaf) { return $candidate }
+    }
+    return (Split-Path -Parent $scriptDir)
+}
+
+function ConvertTo-LibraryId {
+    param([string]$FileName)
+    $base = [IO.Path]::GetFileNameWithoutExtension($FileName)
+    if ($base.Length -gt 3 -and $base.StartsWith('lib', [StringComparison]::OrdinalIgnoreCase)) {
+        return $base.Substring(3)
+    }
+    return $base
+}
+
+function Get-KnownNativeLibraries {
+    return @(
+        [pscustomobject]@{ Id = 'pleasureproject'; Title = 'PleasureProject (шаблон студии)'; OriginalIp = '2.26.99.43' },
+        [pscustomobject]@{ Id = 'ProjectZero'; Title = 'ProjectZero (maint.cpp, IL2CPP/ImGui)'; OriginalIp = '5.42.82.49' },
+        [pscustomobject]@{ Id = 'MoonProject'; Title = 'MoonProject (moon.cpp, Connect hooks)'; OriginalIp = '172.19.0.1' }
+    )
+}
+
+function Get-AndroidMkModules {
+    $mk = Join-Path (Get-JniRoot) 'Android.mk'
+    if (-not (Test-Path -LiteralPath $mk -PathType Leaf)) { return @() }
+    $names = @()
+    foreach ($line in Get-Content -LiteralPath $mk) {
+        if ($line -match '^\s*LOCAL_MODULE\s*:?=\s*([A-Za-z0-9_]+)\s*$') {
+            if ($Matches[1] -ne 'dobby') { $names += $Matches[1] }
+        }
+    }
+    return $names
+}
+
+function Set-LibraryAbiPath {
+    param($Map, [string]$Id, [string]$Abi, [string]$Path)
+    if (-not $Map.Contains($Id)) {
+        $Map[$Id] = @{ Id = $Id; Title = $Id; OriginalIp = ''; Arm64 = ''; Armv7 = '' }
+    }
+    if ($Abi -eq 'arm64-v8a' -and [string]::IsNullOrWhiteSpace($Map[$Id].Arm64)) { $Map[$Id].Arm64 = $Path }
+    elseif ($Abi -eq 'armeabi-v7a' -and [string]::IsNullOrWhiteSpace($Map[$Id].Armv7)) { $Map[$Id].Armv7 = $Path }
+}
+
+function Get-NativeLibrarySearchRoots {
+    $scriptDir = $global:ScriptDir
+    $jni = Get-JniRoot
+    return @(
+        @{ Root = (Join-Path $scriptDir 'templates\libs'); Layout = 'named' },
+        @{ Root = (Join-Path $scriptDir 'templates\lib'); Layout = 'flat' },
+        @{ Root = (Join-Path $jni 'libs'); Layout = 'flat' },
+        @{ Root = (Join-Path (Split-Path -Parent $jni) 'libs'); Layout = 'flat' }
+    )
+}
+
+function Get-NativeLibraryCatalog {
+    $map = [ordered]@{}
+    foreach ($known in Get-KnownNativeLibraries) {
+        $map[$known.Id] = @{
+            Id         = $known.Id
+            Title      = $known.Title
+            OriginalIp = $known.OriginalIp
+            Arm64      = ''
+            Armv7      = ''
+        }
+    }
+    foreach ($module in Get-AndroidMkModules) {
+        if (-not $map.Contains($module)) {
+            $map[$module] = @{ Id = $module; Title = $module; OriginalIp = ''; Arm64 = ''; Armv7 = '' }
+        }
+    }
+
+    foreach ($entry in Get-NativeLibrarySearchRoots) {
+        if (-not (Test-Path -LiteralPath $entry.Root -PathType Container)) { continue }
+        if ($entry.Layout -eq 'named') {
+            Get-ChildItem -LiteralPath $entry.Root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $id = $_.Name
+                foreach ($abi in @('arm64-v8a', 'armeabi-v7a')) {
+                    $abiDir = Join-Path $_.FullName $abi
+                    if (-not (Test-Path -LiteralPath $abiDir -PathType Container)) { continue }
+                    $preferred = Join-Path $abiDir ("lib$id.so")
+                    $path = $null
+                    if (Test-Path -LiteralPath $preferred -PathType Leaf) { $path = $preferred }
+                    else {
+                        $any = Get-ChildItem -LiteralPath $abiDir -Filter 'lib*.so' -File -ErrorAction SilentlyContinue |
+                            Where-Object { (ConvertTo-LibraryId $_.Name) -ne 'dobby' } |
+                            Select-Object -First 1
+                        if ($any) { $path = $any.FullName }
+                    }
+                    if ($path) { Set-LibraryAbiPath -Map $map -Id $id -Abi $abi -Path $path }
+                }
+            }
+        } else {
+            foreach ($abi in @('arm64-v8a', 'armeabi-v7a')) {
+                $abiDir = Join-Path $entry.Root $abi
+                if (-not (Test-Path -LiteralPath $abiDir -PathType Container)) { continue }
+                Get-ChildItem -LiteralPath $abiDir -Filter 'lib*.so' -File -ErrorAction SilentlyContinue | ForEach-Object {
+                    $id = ConvertTo-LibraryId $_.Name
+                    if ($id -eq 'dobby') { return }
+                    Set-LibraryAbiPath -Map $map -Id $id -Abi $abi -Path $_.FullName
+                }
+            }
+        }
+    }
+
+    $list = @()
+    foreach ($key in $map.Keys) {
+        $item = $map[$key]
+        $list += [pscustomobject]@{
+            Id         = $item.Id
+            Title      = $item.Title
+            OriginalIp = $item.OriginalIp
+            Arm64      = $item.Arm64
+            Armv7      = $item.Armv7
+            Present    = -not [string]::IsNullOrWhiteSpace($item.Arm64)
+        }
+    }
+    return $list
+}
+
 function Get-DefaultLibs {
+    $catalog = @(Get-NativeLibraryCatalog)
+    foreach ($preferred in @('pleasureproject', 'MoonProject', 'ProjectZero')) {
+        $hit = $catalog | Where-Object { $_.Id -eq $preferred -and $_.Present } | Select-Object -First 1
+        if ($hit) { return @{ arm64 = $hit.Arm64; armv7 = $hit.Armv7 } }
+    }
+    $any = $catalog | Where-Object { $_.Present } | Select-Object -First 1
+    if ($any) { return @{ arm64 = $any.Arm64; armv7 = $any.Armv7 } }
     return @{
         arm64 = Join-Path $global:ScriptDir 'templates\lib\arm64-v8a\libpleasureproject.so'
         armv7 = Join-Path $global:ScriptDir 'templates\lib\armeabi-v7a\libpleasureproject.so'
+    }
+}
+
+function Resolve-NativeLibrary {
+    param([System.Collections.IDictionary]$Config)
+    $id = [string]$Config.LibId
+    $name = [string]$Config.LibName
+    if ([string]::IsNullOrWhiteSpace($id)) { $id = $name }
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = $id }
+
+    $arm64 = [string]$Config.LibArm64
+    $armv7 = [string]$Config.LibArmv7
+    $originalIp = ''
+    $catalog = @(Get-NativeLibraryCatalog)
+    $match = $null
+    if (-not [string]::IsNullOrWhiteSpace($id)) {
+        $match = $catalog | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+    }
+    if (-not $match -and -not [string]::IsNullOrWhiteSpace($name)) {
+        $match = $catalog | Where-Object { $_.Id -eq $name } | Select-Object -First 1
+    }
+    if ($match) {
+        if ([string]::IsNullOrWhiteSpace($arm64)) { $arm64 = [string]$match.Arm64 }
+        if ([string]::IsNullOrWhiteSpace($armv7)) { $armv7 = [string]$match.Armv7 }
+        $originalIp = [string]$match.OriginalIp
+        if ([string]::IsNullOrWhiteSpace($id)) { $id = $match.Id }
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = $match.Id }
+    }
+    $hasCustom = -not [string]::IsNullOrWhiteSpace([string]$Config.LibArm64)
+    $skipFallback = (-not $hasCustom) -and -not [string]::IsNullOrWhiteSpace([string]$Config.LibId)
+    if (-not $skipFallback -and ([string]::IsNullOrWhiteSpace($arm64) -or -not (Test-Path -LiteralPath $arm64 -PathType Leaf))) {
+        $fallback = Get-DefaultLibs
+        if ([string]::IsNullOrWhiteSpace($arm64)) { $arm64 = $fallback.arm64 }
+        if ([string]::IsNullOrWhiteSpace($armv7)) { $armv7 = $fallback.armv7 }
+    }
+    if ([string]::IsNullOrWhiteSpace($arm64) -or -not (Test-Path -LiteralPath $arm64 -PathType Leaf)) {
+        $available = @($catalog | Where-Object { $_.Present } | ForEach-Object { $_.Id })
+        if (-not $available) { $available = @('(нет собранных .so)') }
+        throw ("Либа '{0}' не найдена (arm64-v8a). Доступны: {1}. Положите lib{0}.so в templates\libs\{0}\arm64-v8a\ или соберите ndk-build." -f $id, ($available -join ', '))
+    }
+    if ([string]::IsNullOrWhiteSpace($armv7) -or -not (Test-Path -LiteralPath $armv7 -PathType Leaf)) {
+        throw "Либа '$id': нет armeabi-v7a .so. Укажите файл или положите его рядом в armeabi-v7a."
+    }
+    return [pscustomobject]@{
+        Id         = $id
+        LibName    = $name
+        Arm64      = $arm64
+        Armv7      = $armv7
+        OriginalIp = $originalIp
+    }
+}
+
+function Sync-LibraryUi {
+    param([bool]$OverwritePaths = $false)
+    if (-not $script:Fields -or -not $script:Fields.ContainsKey('LibId')) { return }
+    $id = $script:Fields['LibId'].Text
+    if ([string]::IsNullOrWhiteSpace($id)) { return }
+    $match = @(Get-NativeLibraryCatalog) | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+    if (-not $match) { return }
+    if ($script:Fields.ContainsKey('LibName') -and ($OverwritePaths -or [string]::IsNullOrWhiteSpace($script:Fields['LibName'].Text))) {
+        $script:Fields['LibName'].Text = $match.Id
+    }
+    if ($script:Fields.ContainsKey('LibArm64') -and ($OverwritePaths -or [string]::IsNullOrWhiteSpace($script:Fields['LibArm64'].Text))) {
+        $script:Fields['LibArm64'].Text = [string]$match.Arm64
+    }
+    if ($script:Fields.ContainsKey('LibArmv7') -and ($OverwritePaths -or [string]::IsNullOrWhiteSpace($script:Fields['LibArmv7'].Text))) {
+        $script:Fields['LibArmv7'].Text = [string]$match.Armv7
+    }
+    $abis = @()
+    if ($match.Arm64) { $abis += 'arm64-v8a' }
+    if ($match.Armv7) { $abis += 'armeabi-v7a' }
+    $ip = if ($match.OriginalIp) { " · исходный IP $($match.OriginalIp)" } else { '' }
+    if ($abis.Count) { Write-Log "Либа $($match.Id): $($abis -join ', ')$ip" }
+    else { Write-Log "Либа $($match.Id): .so не найдены — соберите ndk-build или укажите файлы вручную" }
+}
+
+function Set-LibraryComboItems {
+    param($Combo, [string]$Selected = '')
+    if (-not $Combo) { return }
+    $ids = @(Get-NativeLibraryCatalog | ForEach-Object { $_.Id })
+    $Combo.Items.Clear()
+    foreach ($id in $ids) { [void]$Combo.Items.Add($id) }
+    if (-not [string]::IsNullOrWhiteSpace($Selected) -and -not $Combo.Items.Contains($Selected)) {
+        [void]$Combo.Items.Add($Selected)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Selected) -and $Combo.Items.Contains($Selected)) {
+        $Combo.Text = $Selected
+    } elseif ($Combo.Items.Count -gt 0 -and $Combo.SelectedIndex -lt 0) {
+        $Combo.SelectedIndex = 0
     }
 }
 
@@ -222,36 +443,147 @@ function Remove-Bom {
     }
 }
 
+function Test-Ipv4String {
+    param([string]$Value)
+    $parts = $Value.Split('.')
+    if ($parts.Count -ne 4) { return $false }
+    foreach ($part in $parts) {
+        if ($part -notmatch '^\d{1,3}$') { return $false }
+        if ([int]$part -gt 255) { return $false }
+    }
+    return $true
+}
+
+function Get-KnownLibServerIps {
+    return @('2.26.99.43', '144.31.157.245', '94.156.114.39', '5.42.82.49', '172.19.0.1')
+}
+
+function Get-EmbeddedIpv4s {
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $found = New-Object System.Collections.Generic.List[string]
+    $cur = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -le $bytes.Length; $i++) {
+        $isDigitOrDot = $false
+        if ($i -lt $bytes.Length) {
+            $ch = $bytes[$i]
+            $isDigitOrDot = ($ch -ge 48 -and $ch -le 57) -or $ch -eq 46
+        }
+        if ($isDigitOrDot) {
+            [void]$cur.Append([char]$bytes[$i])
+        } else {
+            $value = $cur.ToString()
+            [void]$cur.Clear()
+            if ($value -match '^\d{1,3}(\.\d{1,3}){3}$' -and (Test-Ipv4String $value) -and -not $found.Contains($value)) {
+                $found.Add($value)
+            }
+        }
+    }
+    return @($found)
+}
+
+function Test-ByteSequenceAt {
+    param([byte[]]$Haystack, [int]$Offset, [byte[]]$Needle)
+    if ($Offset -lt 0 -or ($Offset + $Needle.Length) -gt $Haystack.Length) { return $false }
+    for ($j = 0; $j -lt $Needle.Length; $j++) {
+        if ($Haystack[$Offset + $j] -ne $Needle[$j]) { return $false }
+    }
+    return $true
+}
+
+function Test-SoContainsIp {
+    param([byte[]]$Bytes, [string]$Ip)
+    $needle = [System.Text.Encoding]::ASCII.GetBytes($Ip)
+    for ($i = 0; $i -le $Bytes.Length - $needle.Length; $i++) {
+        if (Test-ByteSequenceAt -Haystack $Bytes -Offset $i -Needle $needle) { return $true }
+    }
+    return $false
+}
+
+function Resolve-LibOriginalIp {
+    param([string]$SoPath, [string]$Preferred = '')
+    if (-not (Test-Path -LiteralPath $SoPath -PathType Leaf)) { return '' }
+    $bytes = [System.IO.File]::ReadAllBytes($SoPath)
+    $embedded = @(Get-EmbeddedIpv4s -Path $SoPath)
+    if ($Preferred -and (Test-SoContainsIp -Bytes $bytes -Ip $Preferred)) { return $Preferred }
+    foreach ($known in Get-KnownLibServerIps) {
+        if (Test-SoContainsIp -Bytes $bytes -Ip $known) { return $known }
+    }
+    foreach ($ip in $embedded) {
+        if ($ip -notin @('127.0.0.1', '0.0.0.0')) { return $ip }
+    }
+    return ''
+}
+
+function Get-LibIpPatchTargets {
+    param([byte[]]$Bytes, [string]$Preferred = '')
+    $targets = New-Object System.Collections.Generic.List[string]
+    $candidates = @()
+    if ($Preferred) { $candidates += $Preferred }
+    $candidates += Get-KnownLibServerIps
+    foreach ($ip in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($ip)) { continue }
+        if (-not (Test-SoContainsIp -Bytes $Bytes -Ip $ip)) { continue }
+        if (-not $targets.Contains($ip)) { $targets.Add($ip) }
+    }
+    return @($targets)
+}
+
+function Replace-Ipv4InBytes {
+    param([byte[]]$Bytes, [string]$OldIP, [string]$NewIP)
+    $oldB = [System.Text.Encoding]::ASCII.GetBytes($OldIP)
+    $newB = [System.Text.Encoding]::ASCII.GetBytes($NewIP)
+    if ($newB.Length -gt 15) { throw "IP '$NewIP' длиннее максимального IPv4 (15 симв.)." }
+    $count = 0
+    $i = 0
+    while ($i -le $Bytes.Length - $oldB.Length) {
+        if (-not (Test-ByteSequenceAt -Haystack $Bytes -Offset $i -Needle $oldB)) { $i++; continue }
+        $afterPos = $i + $oldB.Length
+        $after = if ($afterPos -lt $Bytes.Length) { $Bytes[$afterPos] } else { 0 }
+        $pad16 = $false
+        if (($i + 16) -le $Bytes.Length) {
+            $pad16 = $true
+            for ($k = $oldB.Length; $k -lt 16; $k++) {
+                if ($Bytes[$i + $k] -ne 0) { $pad16 = $false; break }
+            }
+        }
+        $bounded = ($after -eq 0) -or ($after -lt 48) -or ($after -gt 57)
+        if (-not $pad16 -and -not $bounded) { $i++; continue }
+        $slot = if ($pad16) { 16 } else { $oldB.Length }
+        if ($newB.Length -gt $slot) { $i++; continue }
+        for ($k = 0; $k -lt $newB.Length; $k++) { $Bytes[$i + $k] = $newB[$k] }
+        for ($k = $newB.Length; $k -lt $slot; $k++) { $Bytes[$i + $k] = 0 }
+        $count++
+        $i += $slot
+    }
+    return $count
+}
+
 function Patch-LibIP {
-    param([string]$SoPath, [string]$NewIP)
-    $old = '2.26.99.43'
-    $bufLen = 16   # INET_ADDRSTRLEN: максимум IPv4 = 15 симв. + null
+    param([string]$SoPath, [string]$NewIP, [string]$OldIP = '', [switch]$AllowMissing)
+    if ([string]::IsNullOrWhiteSpace($NewIP)) { return 0 }
     if ($NewIP.Length -gt 15) { throw "IP '$NewIP' длиннее максимального IPv4 (15 симв., например 255.255.255.255)." }
     $b = [System.IO.File]::ReadAllBytes($SoPath)
-    $oldB = [System.Text.Encoding]::ASCII.GetBytes($old)
-    $newB = [System.Text.Encoding]::ASCII.GetBytes($NewIP)
+    $targets = New-Object System.Collections.Generic.List[string]
+    if ($OldIP -and (Test-SoContainsIp -Bytes $b -Ip $OldIP) -and $OldIP -ne $NewIP) { $targets.Add($OldIP) }
+    foreach ($ip in (Get-LibIpPatchTargets -Bytes $b -Preferred $OldIP)) {
+        if ($ip -eq $NewIP) { continue }
+        if (-not $targets.Contains($ip)) { $targets.Add($ip) }
+    }
     $count = 0
-    for ($i = 0; $i -le $b.Length - $bufLen; $i++) {
-        $ok = $true
-        for ($j = 0; $j -lt $oldB.Length; $j++) {
-            if ($b[$i+$j] -ne $oldB[$j]) { $ok = $false; break }
-        }
-        if ($ok) {
-            $pad = $true
-            for ($j = $oldB.Length; $j -lt $bufLen; $j++) { if ($b[$i+$j] -ne 0) { $pad = $false; break } }
-            if (-not $pad) { $i += $bufLen - 1; continue }
-            for ($j = 0; $j -lt $newB.Length; $j++) { $b[$i+$j] = $newB[$j] }
-            for ($j = $newB.Length; $j -lt $bufLen; $j++) { $b[$i+$j] = 0 }
-            $count++
-            $i += $bufLen - 1
-        }
+    $replaced = @()
+    foreach ($old in $targets) {
+        $n = Replace-Ipv4InBytes -Bytes $b -OldIP $old -NewIP $NewIP
+        if ($n -gt 0) { $count += $n; $replaced += "$old($n)" }
     }
     if ($count -gt 0) {
         [System.IO.File]::WriteAllBytes($SoPath, $b)
-        Write-Log "Пропатчен IP в $SoPath : $old -> $NewIP (замен: $count)"
-    } else {
-        throw "Не найден старый IP '$old' в $SoPath. Либка не та."
+        Write-Log ("Пропатчен IP в {0} -> {1} (замен: {2}: {3})" -f $SoPath, $NewIP, $count, ($replaced -join ', '))
+        return $count
     }
+    $msg = "IP для замены не найден в $SoPath — патч пропущен. Либа останется со своим адресом."
+    if ($AllowMissing) { Write-Log $msg; return 0 }
+    throw $msg
 }
 
 function Find-Smali {
@@ -427,7 +759,7 @@ function Write-GoogleServices {
 }
 
 function Deployment-LibAndObb {
-    param([string]$WorkRoot, [hashtable]$C, [int]$VersionCode, [string]$Arm64Lib, [string]$Armv7Lib)
+    param([string]$WorkRoot, [hashtable]$C, [int]$VersionCode, [string]$Arm64Lib, [string]$Armv7Lib, [string]$OriginalIp = '')
     # Libs
     foreach ($abi in @('arm64-v8a','armeabi-v7a')) {
         $dir = Join-Path $WorkRoot "lib\$abi"
@@ -435,8 +767,8 @@ function Deployment-LibAndObb {
         $src = if ($abi -eq 'arm64-v8a') { $Arm64Lib } else { $Armv7Lib }
         $dst = Join-Path $dir ("lib" + $C.LibName + ".so")
         Copy-Item $src $dst -Force
-        if ($C.ServerIp -and $C.ServerIp -ne '2.26.99.43') {
-            Patch-LibIP -SoPath $dst -NewIP $C.ServerIp
+        if ($C.ServerIp) {
+            Patch-LibIP -SoPath $dst -NewIP $C.ServerIp -OldIP $OriginalIp -AllowMissing
         }
     }
     Write-Log "lib$($C.LibName).so: добавлены arm64-v8a + armeabi-v7a"
@@ -467,6 +799,9 @@ function Build-APK {
         Assert-NotEmpty 'Пароль ключа' $C.KsKeyPass | Out-Null
         Assert-NotEmpty 'Название приложения' $C.AppLabel | Out-Null
         Assert-NotEmpty 'Имя библиотеки' $C.LibName | Out-Null
+        $previewLib = Resolve-NativeLibrary -Config $C
+        Assert-FileExists ("Либа arm64 ({0})" -f $previewLib.Id) $previewLib.Arm64 | Out-Null
+        Assert-FileExists ("Либа armeabi-v7a ({0})" -f $previewLib.Id) $previewLib.Armv7 | Out-Null
         $Pkg = Assert-NotEmpty 'Package' $C.Package
         if ($Pkg -notmatch '^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$') { throw "Package '$Pkg' некорректен (пример: com.pleasureprod.pleasureproject)." }
         Assert-NotEmpty 'Web client' $C.WebClient | Out-Null
@@ -527,8 +862,10 @@ function Build-APK {
         $sha1 = Get-KeystoreSha1 -Ks $C.KsPath -StorePass $C.KsStorePass -Alias $C.KsAlias
         Write-GoogleServices -WorkRoot $workDec -C $C -Sha1 $sha1
 
-        $libs = Get-DefaultLibs
-        Deployment-LibAndObb -WorkRoot $workDec -C $C -VersionCode $ver -Arm64Lib $libs.arm64 -Armv7Lib $libs.armv7
+        $resolved = Resolve-NativeLibrary -Config $C
+        if ([string]::IsNullOrWhiteSpace($C.LibName)) { $C.LibName = $resolved.LibName }
+        Write-Log ("Выбрана либа: {0} -> lib{1}.so" -f $resolved.Id, $C.LibName)
+        Deployment-LibAndObb -WorkRoot $workDec -C $C -VersionCode $ver -Arm64Lib $resolved.Arm64 -Armv7Lib $resolved.Armv7 -OriginalIp $resolved.OriginalIp
 
         # --- 5. сборка ---
         $unsigned = Join-Path $work 'unsigned.apk'
@@ -583,7 +920,10 @@ function New-ConfigDefaults {
         OutApk       = ''
         Package      = 'com.pleasureprod.pleasureproject'
         AppLabel     = 'PleasureProject'
+        LibId        = 'pleasureproject'
         LibName      = 'pleasureproject'
+        LibArm64     = ''
+        LibArmv7     = ''
         ServerIp     = '2.26.99.43'
         WebClient    = '687942041441-kpuqemaimerqcldhdejpps8sildrfo7l.apps.googleusercontent.com'
         AndroidClient= '687942041441-dg9gh1jm6htv0l7vevfgl05kf0kd9n2o.apps.googleusercontent.com'
@@ -634,6 +974,7 @@ function New-FieldRow {
             elseif ($kind -eq 'ipa') { $dlg.Filter = 'IPA (*.ipa)|*.ipa' }
             elseif ($kind -eq 'plist') { $dlg.Filter = 'iOS Firebase (*.plist)|*.plist' }
             elseif ($kind -eq 'json') { $dlg.Filter = 'Patch plan (*.json)|*.json' }
+            elseif ($kind -eq 'so') { $dlg.Filter = 'Native lib (*.so)|*.so' }
             elseif ($kind -eq 'outipa') {
                 $s = New-Object System.Windows.Forms.SaveFileDialog
                 $s.Filter = 'IPA (*.ipa)|*.ipa'
@@ -647,7 +988,21 @@ function New-FieldRow {
                 if ($s.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $tbx.Text = $s.FileName }
                 return
             }
-            if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $tbx.Text = $dlg.FileName }
+            if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                $tbx.Text = $dlg.FileName
+                if ($kind -eq 'so' -and $key -eq 'LibArm64' -and (Get-Command ConvertTo-LibraryId -ErrorAction SilentlyContinue)) {
+                    $pickedId = ConvertTo-LibraryId ([IO.Path]::GetFileName($dlg.FileName))
+                    if ($script:Fields.ContainsKey('LibId')) {
+                        if (-not $script:Fields['LibId'].Items.Contains($pickedId)) { [void]$script:Fields['LibId'].Items.Add($pickedId) }
+                        $script:Fields['LibId'].Text = $pickedId
+                    }
+                    if ($script:Fields.ContainsKey('LibName')) { $script:Fields['LibName'].Text = $pickedId }
+                    $v7 = $dlg.FileName.Replace('arm64-v8a', 'armeabi-v7a')
+                    if ($v7 -ne $dlg.FileName -and (Test-Path -LiteralPath $v7 -PathType Leaf) -and $script:Fields.ContainsKey('LibArmv7')) {
+                        $script:Fields['LibArmv7'].Text = $v7
+                    }
+                }
+            }
         })
         $Panel.Controls.Add($lbl, 0, $row)
         $Panel.Controls.Add($tb, 1, $row)
@@ -784,8 +1139,32 @@ function Show-Main {
     New-SectionHeader -Panel $leftPanel -Text 'Приложение'
     New-FieldRow -Panel $leftPanel -Key 'Package'   -Label 'Package:'
     New-FieldRow -Panel $leftPanel -Key 'AppLabel'  -Label 'Название (label):'
-    New-FieldRow -Panel $leftPanel -Key 'LibName'   -Label 'Имя нативной либы (loadLibrary):'
-    New-FieldRow -Panel $leftPanel -Key 'ServerIp'  -Label 'IP сервера (2.26.99.43 — до 15 симв.)'
+
+    $libLabel = New-Object System.Windows.Forms.Label
+    $libLabel.Text = 'Нативная либа:'
+    $libLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $libLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $libLabel.AutoSize = $true
+    $libBox = New-Object System.Windows.Forms.ComboBox
+    $libBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $libBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $libBox.Name = 'fld_LibId'
+    $btnLibRefresh = New-Object System.Windows.Forms.Button
+    $btnLibRefresh.Text = 'Обновить'
+    $btnLibRefresh.Width = 80
+    $libRow = $leftPanel.RowCount
+    $leftPanel.Controls.Add($libLabel, 0, $libRow)
+    $leftPanel.Controls.Add($libBox, 1, $libRow)
+    $leftPanel.Controls.Add($btnLibRefresh, 2, $libRow)
+    $script:FieldRows['LibId'] = @{ Panel = $leftPanel; Row = $libRow; Controls = @($libLabel, $libBox, $btnLibRefresh) }
+    $script:Fields['LibId'] = $libBox
+    $leftPanel.RowCount = $libRow + 1
+    Set-LibraryComboItems -Combo $libBox -Selected $c.LibId
+
+    New-FieldRow -Panel $leftPanel -Key 'LibName'   -Label 'Имя loadLibrary (имя .so без lib):'
+    New-FieldRow -Panel $leftPanel -Key 'LibArm64'  -Label 'arm64-v8a .so:' -Browse $true -BrowseKind 'so'
+    New-FieldRow -Panel $leftPanel -Key 'LibArmv7'  -Label 'armeabi-v7a .so:' -Browse $true -BrowseKind 'so'
+    New-FieldRow -Panel $leftPanel -Key 'ServerIp'  -Label 'IP сервера (под патч выбранной либы, до 15 симв.)'
 
     New-SectionHeader -Panel $leftPanel -Text 'Google Sign-In / Firebase'
     New-FieldRow -Panel $leftPanel -Key 'WebClient'     -Label 'Web client ID (oauth client_type 3):'
@@ -807,6 +1186,25 @@ function Show-Main {
     foreach ($k in $c.Keys) {
         if ($script:Fields.ContainsKey($k)) { $script:Fields[$k].Text = $c[$k] }
     }
+    if ([string]::IsNullOrWhiteSpace($libBox.Text) -and $c.LibName) {
+        Set-LibraryComboItems -Combo $libBox -Selected $c.LibName
+    } elseif (-not [string]::IsNullOrWhiteSpace($c.LibId)) {
+        Set-LibraryComboItems -Combo $libBox -Selected $c.LibId
+    }
+    Sync-LibraryUi -OverwritePaths:([string]::IsNullOrWhiteSpace($c.LibArm64))
+    $script:LibraryComboReady = $true
+    $libBox.Add_SelectedIndexChanged({
+        if (-not $script:LibraryComboReady) { return }
+        Sync-LibraryUi -OverwritePaths:$true
+    })
+    $btnLibRefresh.Add_Click({
+        $current = $script:Fields['LibId'].Text
+        $script:LibraryComboReady = $false
+        try {
+            Set-LibraryComboItems -Combo $script:Fields['LibId'] -Selected $current
+            Sync-LibraryUi -OverwritePaths:$true
+        } finally { $script:LibraryComboReady = $true }
+    })
 
     if ($typeBox.SelectedIndex -lt 0) { $typeBox.SelectedIndex = 0 }
     $typeBox.Add_SelectedIndexChanged({
