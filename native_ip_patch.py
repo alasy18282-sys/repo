@@ -8,7 +8,10 @@ The Connect hooks store a 15-byte buffer XOR-encoded with 0x2E ('.'):
   bytes 12-13 — MOVZ immediate
   byte 14    — MOVZ immediate (encoded NUL is 0x2E)
 
-armeabi-v7a builds still use a bounded ASCII IPv4 slot.
+armeabi-v7a builds keep a plaintext C string. INET_ADDRSTRLEN is 16, but some
+builds pack `94.156.114.39` (13) next to the following symbol. A longer
+ServerIp is relocated: the host is copied into an unused .rodata slot and
+Thumb PIC literals (`ldr` + `add rN, pc`) are retargeted.
 """
 from __future__ import annotations
 
@@ -278,6 +281,179 @@ def find_ascii_ipv4s(data: bytes):
     return found
 
 
+def _trailing_nuls(buf: bytearray, offset: int, limit: int = 16) -> int:
+    nuls = 0
+    while offset + nuls < len(buf) and nuls < limit and buf[offset + nuls] == 0:
+        nuls += 1
+    return nuls
+
+
+def standalone_cstr(data: bytes, offset: int, text: bytes) -> bool:
+    if offset < 0 or offset + len(text) >= len(data):
+        return False
+    if data[offset:offset + len(text)] != text:
+        return False
+    if data[offset + len(text)] != 0:
+        return False
+    if offset > 0 and 32 <= data[offset - 1] < 127:
+        return False
+    return True
+
+
+def _exec_ranges(data: bytes):
+    try:
+        ranges = []
+        for _vaddr, offset, filesz, flags in elf_load_segments(data):
+            if flags & 1 and filesz:
+                ranges.append((offset, offset + filesz))
+        return ranges or [(0, len(data))]
+    except ValueError:
+        return [(0, len(data))]
+
+
+def find_thumb_pic_refs(data: bytes, dest_va: int):
+    refs = []
+    seen = set()
+    for text_lo, text_hi in _exec_ranges(data):
+        for add_off in range(text_lo, max(text_lo, text_hi - 1), 2):
+            if data[add_off + 1] != 0x44 or not (0x78 <= data[add_off] <= 0x7F):
+                continue
+            rd = data[add_off] - 0x78
+            add_pc = (add_off + 4) & ~3
+            for back in range(2, 64, 2):
+                ldr_off = add_off - back
+                if ldr_off < text_lo:
+                    break
+                hw = struct.unpack_from("<H", data, ldr_off)[0]
+                if (hw & 0xF800) == 0x4800 and ((hw >> 8) & 7) == rd:
+                    lit = ((ldr_off + 4) & ~3) + (hw & 0xFF) * 4
+                    break
+                if ldr_off + 3 >= text_hi:
+                    continue
+                hw1, hw2 = struct.unpack_from("<HH", data, ldr_off)
+                if (hw1 & 0xFF7F) == 0xF85F and ((hw2 >> 12) & 0xF) == rd:
+                    base = (ldr_off + 4) & ~3
+                    imm12 = hw2 & 0xFFF
+                    lit = base + imm12 if (hw1 >> 7) & 1 else base - imm12
+                    break
+            else:
+                continue
+            if not (0 <= lit <= len(data) - 4):
+                continue
+            dest = (add_pc + struct.unpack_from("<i", data, lit)[0]) & 0xFFFFFFFF
+            if dest != dest_va:
+                continue
+            key = (add_off, lit)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append({"add_off": add_off, "lit_off": lit, "add_pc": add_pc})
+    return refs
+
+
+def choose_rodata_slot(data: bytes, size: int = 16, reserved=()):
+    reserved = set(reserved)
+    rodata = None
+    if data[4] == 1 and len(data) > 0xC74B:
+        rodata = (0x9C40, 0xC74B)
+    if rodata is None:
+        return None
+    start, end = rodata
+    i = start
+    while i < end:
+        if 32 <= data[i] < 127:
+            j = i
+            while j < end and 32 <= data[j] < 127:
+                j += 1
+            length = j - i
+            if (
+                length >= size
+                and (j >= end or data[j] == 0)
+                and i not in reserved
+                and not find_thumb_pic_refs(data, i)
+            ):
+                return i
+            i = j + 1
+        else:
+            i += 1
+    return None
+
+
+def retarget_thumb_pic(buf: bytearray, ref: dict, new_va: int) -> None:
+    rel = (new_va - ref["add_pc"]) & 0xFFFFFFFF
+    struct.pack_into("<I", buf, ref["lit_off"], rel)
+
+
+def rewrite_cstring_containing_ip(buf: bytearray, start: int, old_ip: str, new_ip: str) -> bool:
+    try:
+        end = buf.index(0, start)
+    except ValueError:
+        return False
+    text = bytes(buf[start:end]).decode("ascii", errors="strict")
+    if old_ip not in text:
+        return False
+    avail = end - start + 1
+    candidate = text.replace(old_ip, new_ip, 1)
+    encoded = candidate.encode("ascii")
+    if len(encoded) + 1 > avail:
+        encoded = new_ip.encode("ascii")
+        if len(encoded) + 1 > avail:
+            return False
+    buf[start:start + len(encoded)] = encoded
+    for k in range(len(encoded), avail):
+        buf[start + k] = 0
+    return True
+
+
+def relocate_ascii_ipv4(buf: bytearray, old_ip: str, new_ip: str) -> int:
+    old_b = old_ip.encode("ascii")
+    new_b = new_ip.encode("ascii")
+    if len(new_b) > 15:
+        raise ValueError("IPv4 longer than 15 characters")
+    hosts = []
+    start = 0
+    data = bytes(buf)
+    while True:
+        pos = data.find(old_b, start)
+        if pos < 0:
+            break
+        if standalone_cstr(data, pos, old_b):
+            hosts.append(pos)
+        start = pos + 1
+    if not hosts:
+        return 0
+    slot = choose_rodata_slot(data, size=16, reserved=hosts)
+    if slot is None:
+        return 0
+    refs = []
+    for host in hosts:
+        refs.extend(find_thumb_pic_refs(data, host))
+    if not refs:
+        return 0
+    padded = new_b + b"\x00" * (16 - len(new_b))
+    buf[slot:slot + 16] = padded
+    for ref in refs:
+        retarget_thumb_pic(buf, ref, slot)
+    for host in hosts:
+        for k in range(len(old_b)):
+            buf[host + k] = 0
+    rewritten = 0
+    start = 0
+    data = bytes(buf)
+    while True:
+        pos = data.find(old_b, start)
+        if pos < 0:
+            break
+        cstart = pos
+        while cstart > 0 and 32 <= buf[cstart - 1] < 127:
+            cstart -= 1
+        if rewrite_cstring_containing_ip(buf, cstart, old_ip, new_ip):
+            rewritten += 1
+            data = bytes(buf)
+        start = pos + 1
+    return len(refs) + rewritten
+
+
 def replace_ascii_ipv4(buf: bytearray, old_ip: str, new_ip: str) -> int:
     old_b = old_ip.encode("ascii")
     new_b = new_ip.encode("ascii")
@@ -291,22 +467,29 @@ def replace_ascii_ipv4(buf: bytearray, old_ip: str, new_ip: str) -> int:
             i += 1
             continue
         after = buf[i + len(old_b)] if i + len(old_b) < len(buf) else 0
-        pad16 = False
-        if i + 16 <= len(buf):
-            pad16 = all(buf[i + k] == 0 for k in range(len(old_b), 16))
+        nuls = _trailing_nuls(buf, i + len(old_b))
+        pad16 = nuls >= (16 - len(old_b)) and i + 16 <= len(buf)
         bounded = after == 0 or after < 48 or after > 57
         if not pad16 and not bounded:
             i += 1
             continue
-        slot = 16 if pad16 else len(old_b)
-        if len(new_b) > slot:
+        slot = 16 if pad16 else (len(old_b) + nuls)
+        if nuls:
+            slot = max(len(old_b), min(slot, len(old_b) + nuls))
+            if len(new_b) + 1 > slot:
+                i += 1
+                continue
+        elif len(new_b) > slot:
             i += 1
             continue
         buf[i:i + len(new_b)] = new_b
-        for k in range(len(new_b), slot):
+        fill_to = slot if nuls or pad16 else len(new_b)
+        for k in range(len(new_b), fill_to):
             buf[i + k] = 0
         count += 1
-        i += slot
+        i += max(len(new_b), 1)
+    if count == 0 and len(new_b) != len(old_b):
+        count = relocate_ascii_ipv4(buf, old_ip, new_ip)
     return count
 
 
