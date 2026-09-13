@@ -89,7 +89,7 @@ function Get-KnownNativeLibraries {
     return @(
         [pscustomobject]@{ Id = 'pleasureproject'; Title = 'PleasureProject (шаблон студии)'; OriginalIp = '2.26.99.43' },
         [pscustomobject]@{ Id = 'ProjectZero'; Title = 'ProjectZero (maint.cpp, IL2CPP/ImGui)'; OriginalIp = '5.42.82.49' },
-        [pscustomobject]@{ Id = 'MoonProject'; Title = 'MoonProject (moon.cpp, Connect hooks)'; OriginalIp = '172.19.0.1' }
+        [pscustomobject]@{ Id = 'MoonProject'; Title = 'MoonProject (moon.cpp, Connect hooks)'; OriginalIp = '144.31.157.245' }
     )
 }
 
@@ -272,7 +272,12 @@ function Sync-LibraryUi {
     $abis = @()
     if ($match.Arm64) { $abis += 'arm64-v8a' }
     if ($match.Armv7) { $abis += 'armeabi-v7a' }
-    $ip = if ($match.OriginalIp) { " · исходный IP $($match.OriginalIp)" } else { '' }
+    $detectedIp = ''
+    if ($match.Arm64 -and (Test-Path -LiteralPath $match.Arm64 -PathType Leaf)) {
+        $detectedIp = Resolve-LibOriginalIp -SoPath $match.Arm64 -Preferred $match.OriginalIp
+    }
+    if (-not $detectedIp) { $detectedIp = [string]$match.OriginalIp }
+    $ip = if ($detectedIp) { " · исходный IP $detectedIp" } else { '' }
     if ($abis.Count) { Write-Log "Либа $($match.Id): $($abis -join ', ')$ip" }
     else { Write-Log "Либа $($match.Id): .so не найдены — соберите ndk-build или укажите файлы вручную" }
 }
@@ -458,6 +463,46 @@ function Get-KnownLibServerIps {
     return @('2.26.99.43', '144.31.157.245', '94.156.114.39', '5.42.82.49', '172.19.0.1')
 }
 
+function Resolve-StudioPython {
+    $saved = Join-Path $global:ScriptDir 'config\python-path.txt'
+    if (Test-Path -LiteralPath $saved -PathType Leaf) {
+        $path = (Get-Content -LiteralPath $saved -Raw).Trim()
+        if ($path -and (Test-Path -LiteralPath $path -PathType Leaf)) { return $path }
+    }
+    foreach ($name in @('python.exe', 'python3.exe', 'python3', 'python')) {
+        $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($command -and $command.Source -notlike '*\WindowsApps\*') { return $command.Source }
+    }
+    return $null
+}
+
+function Invoke-NativeIpPatch {
+    param([string]$SoPath, [string]$NewIP = '', [string]$OldIP = '', [switch]$Inspect)
+    $python = Resolve-StudioPython
+    $script = Join-Path $global:ScriptDir 'native_ip_patch.py'
+    if (-not $python -or -not (Test-Path -LiteralPath $script -PathType Leaf)) { return $null }
+    $arguments = @($script, '--so', $SoPath)
+    if ($Inspect -or [string]::IsNullOrWhiteSpace($NewIP)) { $arguments += '--inspect' }
+    else {
+        $arguments += @('--new-ip', $NewIP)
+        if ($OldIP) { $arguments += @('--old-ip', $OldIP) }
+    }
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = $null
+        $out = & $python @arguments 2>&1
+        $exitCode = $global:LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    $text = (($out | ForEach-Object { "$_" }) -join [Environment]::NewLine).Trim()
+    if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($text)) { return $null }
+    $jsonLine = ($text -split "[`r`n]+" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+    if (-not $jsonLine) { return $null }
+    try { return ($jsonLine | ConvertFrom-Json) } catch { return $null }
+}
+
 function Get-EmbeddedIpv4s {
     param([string]$Path)
     $bytes = [System.IO.File]::ReadAllBytes($Path)
@@ -503,6 +548,19 @@ function Test-SoContainsIp {
 function Resolve-LibOriginalIp {
     param([string]$SoPath, [string]$Preferred = '')
     if (-not (Test-Path -LiteralPath $SoPath -PathType Leaf)) { return '' }
+    $inspected = Invoke-NativeIpPatch -SoPath $SoPath -Inspect
+    if ($inspected) {
+        $found = @()
+        foreach ($ip in @($inspected.xor_ips)) { if ($ip) { $found += [string]$ip } }
+        foreach ($ip in @($inspected.ascii_ips)) { if ($ip) { $found += [string]$ip } }
+        if ($Preferred -and $found -contains $Preferred) { return $Preferred }
+        foreach ($known in Get-KnownLibServerIps) {
+            if ($found -contains $known) { return $known }
+        }
+        foreach ($ip in $found) {
+            if ($ip -notin @('127.0.0.1', '0.0.0.0', '255.255.255.255')) { return $ip }
+        }
+    }
     $bytes = [System.IO.File]::ReadAllBytes($SoPath)
     $embedded = @(Get-EmbeddedIpv4s -Path $SoPath)
     if ($Preferred -and (Test-SoContainsIp -Bytes $bytes -Ip $Preferred)) { return $Preferred }
@@ -563,6 +621,25 @@ function Patch-LibIP {
     param([string]$SoPath, [string]$NewIP, [string]$OldIP = '', [switch]$AllowMissing)
     if ([string]::IsNullOrWhiteSpace($NewIP)) { return 0 }
     if ($NewIP.Length -gt 15) { throw "IP '$NewIP' длиннее максимального IPv4 (15 симв., например 255.255.255.255)." }
+    $patched = Invoke-NativeIpPatch -SoPath $SoPath -NewIP $NewIP -OldIP $OldIP
+    if ($patched) {
+        if ([int]$patched.count -gt 0) {
+            Write-Log ("Пропатчен IP в {0} -> {1} (замен: {2}: {3})" -f $SoPath, $NewIP, [int]$patched.count, (($patched.replaced) -join ', '))
+            return [int]$patched.count
+        }
+        if ([bool]$patched.already) {
+            Write-Log ("IP в {0} уже равен {1} — замена не нужна." -f $SoPath, $NewIP)
+            return 0
+        }
+        $found = @($patched.found)
+        if ($found.Count) {
+            $msg = "IP для замены не найден в $SoPath (есть: $($found -join ', ')). Либа останется со своим адресом."
+        } else {
+            $msg = "IP для замены не найден в $SoPath — патч пропущен. Либа останется со своим адресом."
+        }
+        if ($AllowMissing) { Write-Log $msg; return 0 }
+        throw $msg
+    }
     $b = [System.IO.File]::ReadAllBytes($SoPath)
     $targets = New-Object System.Collections.Generic.List[string]
     if ($OldIP -and (Test-SoContainsIp -Bytes $b -Ip $OldIP) -and $OldIP -ne $NewIP) { $targets.Add($OldIP) }
@@ -581,7 +658,13 @@ function Patch-LibIP {
         Write-Log ("Пропатчен IP в {0} -> {1} (замен: {2}: {3})" -f $SoPath, $NewIP, $count, ($replaced -join ', '))
         return $count
     }
-    $msg = "IP для замены не найден в $SoPath — патч пропущен. Либа останется со своим адресом."
+    if ($OldIP -eq $NewIP -and $OldIP -and (Test-SoContainsIp -Bytes $b -Ip $NewIP)) {
+        Write-Log ("IP в {0} уже равен {1} — замена не нужна." -f $SoPath, $NewIP)
+        return 0
+    }
+    $embedded = @(Get-EmbeddedIpv4s -Path $SoPath)
+    $hint = if ($embedded) { " В файле есть ASCII: $($embedded -join ', ')." } else { ' В arm64 MoonProject адрес XOR-кодирован (ключ 0x2E), ASCII 172.19.0.1 там нет.' }
+    $msg = "IP для замены не найден в $SoPath — патч пропущен. Либа останется со своим адресом.$hint"
     if ($AllowMissing) { Write-Log $msg; return 0 }
     throw $msg
 }
@@ -768,7 +851,9 @@ function Deployment-LibAndObb {
         $dst = Join-Path $dir ("lib" + $C.LibName + ".so")
         Copy-Item $src $dst -Force
         if ($C.ServerIp) {
-            Patch-LibIP -SoPath $dst -NewIP $C.ServerIp -OldIP $OriginalIp -AllowMissing
+            $detected = Resolve-LibOriginalIp -SoPath $dst -Preferred $OriginalIp
+            $from = if ($detected) { $detected } else { $OriginalIp }
+            Patch-LibIP -SoPath $dst -NewIP $C.ServerIp -OldIP $from -AllowMissing
         }
     }
     Write-Log "lib$($C.LibName).so: добавлены arm64-v8a + armeabi-v7a"
